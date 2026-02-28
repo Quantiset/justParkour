@@ -24,29 +24,29 @@ MODEL_URL = (
 MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                           "pose_landmarker_lite.task")
 
-MAX_POSES = 5                 
+MAX_POSES = 2                
 MIN_DETECTION_CONFIDENCE = 0.5
 MIN_PRESENCE_CONFIDENCE = 0.5
 MIN_TRACKING_CONFIDENCE = 0.5
 
 HISTORY_LEN = 60                    
 
-RUN_WINDOW = 40                   
-RUN_MIN_ZERO_CROSSINGS = 4      
-RUN_MIN_AMPLITUDE = 0.006       
-RUN_MIN_FREQ_HZ = 1.2            
+RUN_WINDOW = 25                   
+RUN_MIN_ZERO_CROSSINGS = 3      
+RUN_MIN_AMPLITUDE = 0.003       
+RUN_MIN_FREQ_HZ = 0.8            
 RUN_MAX_FREQ_HZ = 5.5             
-RUN_REGULARITY_CV = 0.80       
+RUN_REGULARITY_CV = 1.0       
 RUN_HIP_VISIBILITY = 0.35         
-RUN_CONFIRM_FRAMES = 3           
+RUN_CONFIRM_FRAMES = 2           
 RUN_DROP_FRAMES = 6          
 
-JUMP_VEL_THRESHOLD = -0.006        
-JUMP_DISP_THRESHOLD = 0.1        
-JUMP_COOLDOWN_FRAMES = 25     
-JUMP_BASELINE_WINDOW = 30         
-JUMP_LABEL_HOLD = 18           
-JUMP_SHOULDER_COHERENCE = 0.02   
+JUMP_VEL_THRESHOLD = -0.003        
+JUMP_DISP_THRESHOLD = 0.035        
+JUMP_COOLDOWN_FRAMES = 8     
+JUMP_BASELINE_WINDOW = 20         
+JUMP_LABEL_HOLD = 6           
+JUMP_SHOULDER_COHERENCE = 0.05   
 
 MATCH_DIST = 0.20                
 MISSING_TIMEOUT = 20            
@@ -79,6 +79,7 @@ class PersonState:
 
         # Tracking helpers
         self.last_center: tuple[float, float] | None = None
+        self.last_landmarks = None
         self.frames_missing = 0
 
     def update(self, lms):
@@ -107,6 +108,7 @@ class PersonState:
             self.bounce_y.append(ty)         
 
         self.last_center = (tx, ty)
+        self.last_landmarks = lms
         self.frames_missing = 0
 
     def check_running(self, fps: float):
@@ -353,6 +355,127 @@ def ensure_model():
     print("Download complete.\n")
 
 
+
+class PoseDetector:
+    """Reusable wrapper around MediaPipe PoseLandmarker for multi-person
+    running/jumping detection.
+
+    Usage::
+
+        detector = PoseDetector()
+        # in your frame loop:
+        persons = detector.process_frame(bgr_frame, frame_index)
+        for p in persons:
+            print(p.id, p.is_running, p.is_jumping)
+        detector.close()
+    """
+
+    def __init__(self, max_poses=MAX_POSES, fps=30.0):
+        ensure_model()
+        self.fps = fps
+        self._persons: list[PersonState] = []
+
+        base_opts = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+        opts = mp_vision.PoseLandmarkerOptions(
+            base_options=base_opts,
+            num_poses=max_poses,
+            min_pose_detection_confidence=MIN_DETECTION_CONFIDENCE,
+            min_pose_presence_confidence=MIN_PRESENCE_CONFIDENCE,
+            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+            running_mode=mp_vision.RunningMode.VIDEO,
+        )
+        self._landmarker = mp_vision.PoseLandmarker.create_from_options(opts)
+
+    def process_frame(self, frame_bgr, frame_idx: int) -> list[PersonState]:
+        """Run detection on a BGR frame and return active PersonState list.
+
+        Each PersonState has up-to-date ``is_running`` and ``is_jumping``
+        flags, plus an ``id`` and ``frames_missing`` counter.
+        """
+        rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        ts_ms = int(frame_idx * 1000.0 / self.fps)
+
+        result = self._landmarker.detect_for_video(mp_img, ts_ms)
+
+        if result.pose_landmarks:
+            matches = match_poses(self._persons, result.pose_landmarks)
+            active: list[PersonState] = []
+
+            for person, lms in matches:
+                person.update(lms)
+                person.check_running(self.fps)
+                person.check_jumping(self.fps)
+                active.append(person)
+
+            matched_ids = {id(m[0]) for m in matches}
+            for p in self._persons:
+                if id(p) not in matched_ids and p.frames_missing < MISSING_TIMEOUT:
+                    active.append(p)
+
+            self._persons = active
+        else:
+            for p in self._persons:
+                p.frames_missing += 1
+            self._persons = [p for p in self._persons
+                             if p.frames_missing < MISSING_TIMEOUT]
+
+        return list(self._persons)
+
+    @property
+    def visible_count(self) -> int:
+        """Number of persons currently visible (not missing)."""
+        return sum(1 for p in self._persons if p.frames_missing == 0)
+
+    def close(self):
+        self._landmarker.close()
+
+
+class SinglePoseDetector:
+    """Lightweight single-person pose detector using IMAGE mode.
+
+    Designed for the YOLO-crop workflow: crop each person's bounding box
+    from the frame, then call ``detect_crop()`` on each crop individually.
+    IMAGE mode means no timestamp tracking is required, and each call is
+    fully independent.
+
+    Usage::
+
+        spd = SinglePoseDetector()
+        landmarks = spd.detect_crop(cropped_bgr_image)
+        if landmarks:
+            person_state.update(landmarks)
+        spd.close()
+    """
+
+    def __init__(self):
+        ensure_model()
+        base_opts = mp_python.BaseOptions(model_asset_path=MODEL_PATH)
+        opts = mp_vision.PoseLandmarkerOptions(
+            base_options=base_opts,
+            num_poses=1,
+            min_pose_detection_confidence=MIN_DETECTION_CONFIDENCE,
+            min_pose_presence_confidence=MIN_PRESENCE_CONFIDENCE,
+            min_tracking_confidence=MIN_TRACKING_CONFIDENCE,
+            running_mode=mp_vision.RunningMode.IMAGE,
+        )
+        self._landmarker = mp_vision.PoseLandmarker.create_from_options(opts)
+
+    def detect_crop(self, crop_bgr):
+        """Run pose detection on a single cropped BGR image.
+
+        Returns: list of NormalizedLandmark, or None if no pose found.
+        Coordinates are normalised to the crop dimensions (0-1).
+        """
+        rgb = cv2.cvtColor(crop_bgr, cv2.COLOR_BGR2RGB)
+        mp_img = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = self._landmarker.detect(mp_img)
+        if result.pose_landmarks and len(result.pose_landmarks) > 0:
+            return result.pose_landmarks[0]
+        return None
+
+    def close(self):
+        self._landmarker.close()
 
 def main():
     # parse input source

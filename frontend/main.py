@@ -1,330 +1,448 @@
+"""
+Dance-game frontend with live webcam pose-detection overlay.
+
+States:
+  INTRO     – "Stand in frame!" prompt; waiting for ≥1 person.
+  COUNTDOWN – 5-second countdown; player count locked at end.
+  PLAYING   – Avatar HUD with action circles over the video.
+"""
+
 import pygame
 import cv2
 import numpy as np
 import time
-import math
 import os
-import yt_dlp
+import sys
+import json
 
-VIDEO_URL    = "https://www.youtube.com/watch?v=lekKHbYQGxM"
-WINDOW_WIDTH  = 960
-WINDOW_HEIGHT = 540
-FPS           = 60
-AVATAR_SIZE   = 72
+# ── Allow importing body.py from the project root ──────────────────
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from body import PoseDetector, draw_skeleton  # noqa: E402
+from ultralytics import YOLO  # noqa: E402
 
+# ── Constants ───────────────────────────────────────────────────────
+WINDOW_WIDTH  = 1280
+WINDOW_HEIGHT = 720
+FPS           = 30
+AVATAR_SIZE   = 80
+COUNTDOWN_SECONDS = 5
+CIRCLE_RADIUS = 14
+SIDEBAR_WIDTH = 220
+
+DEBUG_W = WINDOW_WIDTH  // 4
+DEBUG_H = WINDOW_HEIGHT // 4
+
+# ── Colours ─────────────────────────────────────────────────────────
+DARK   = (18, 18, 24)
 WHITE  = (255, 255, 255)
-BLACK  = (0,   0,   0  )
-DARK   = (10,  10,  20 )
-RED    = (255, 60,  80 )
-YELLOW = (255, 230, 0  )
-CYAN   = (0,   230, 255)
-PINK   = (255, 80,  200)
-GREEN  = (80,  255, 160)
+BLACK  = (0, 0, 0)
+GREEN  = (0, 200, 80)
+ORANGE = (255, 160, 0)
+GOLD   = (255, 215, 0)
+SIDEBAR_BG = (20, 20, 30, 180)
 
-PLAYER_COLORS = [
-    (0,   200, 255),
-    (255, 80,  200),
-    (255, 220, 0  ),
-    (80,  255, 160),
-]
-VIDEO_PATH = "video.mp4"
-
-ydl_opts = {
-    'outtmpl': 'video.%(ext)s',
-    'format': 'best[ext=mp4]',
-}
-
-with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-    ydl.download([VIDEO_URL])
-
+# ── Pygame init ─────────────────────────────────────────────────────
 pygame.init()
 screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-pygame.display.set_caption("Dance Game")
+pygame.display.set_caption("Dance Game – Body Detection")
 clock = pygame.time.Clock()
 
-try:
-    score_font = pygame.font.SysFont("Impact", 20)
-    hit_font   = pygame.font.SysFont("Impact", 56)
-    small_font = pygame.font.SysFont("Arial",  14)
-    init_font  = pygame.font.SysFont("Impact", 38)
-    amaz_font  = pygame.font.SysFont("Impact", 22)
-except Exception:
-    score_font = hit_font = small_font = init_font = amaz_font = pygame.font.SysFont(None, 32)
+title_font = pygame.font.SysFont("arial", 48, bold=True)
+count_font = pygame.font.SysFont("arial", 120, bold=True)
+label_font = pygame.font.SysFont("arial", 18, bold=True)
 
-players = ["Alice", "Bob", "You"]
-profiles = ["creeper.jpg", "skeleton.jpg", "zombie.jpg"] 
-scores  = {p: 0 for p in players}
+# ── Load avatars ────────────────────────────────────────────────────
+ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
+AVATAR_FILES = ["creeper.jpg", "skeleton.jpg", "zombie.jpg"]
 
-def load_avatar(index):
-    path = f"assets/{profiles[index]}"
-    if os.path.exists(path):
-        try:
-            img = pygame.image.load(path).convert_alpha()
-            return pygame.transform.smoothscale(img, (AVATAR_SIZE, AVATAR_SIZE))
-        except Exception:
-            pass
-    surf = pygame.Surface((AVATAR_SIZE, AVATAR_SIZE), pygame.SRCALPHA)
-    color = PLAYER_COLORS[index % len(PLAYER_COLORS)]
-    surf.fill((*color, 210))
-    letter = init_font.render(players[index][0].upper(), True, BLACK)
-    surf.blit(letter, (AVATAR_SIZE // 2 - letter.get_width() // 2,
-                        AVATAR_SIZE // 2 - letter.get_height() // 2))
-    return surf
+def load_avatar(index: int) -> pygame.Surface:
+    fname = AVATAR_FILES[index % len(AVATAR_FILES)]
+    path = os.path.join(ASSET_DIR, fname)
+    img = pygame.image.load(path).convert_alpha()
+    return pygame.transform.smoothscale(img, (AVATAR_SIZE, AVATAR_SIZE))
 
-avatars = [load_avatar(i) for i in range(len(players))]
-
-cap = cv2.VideoCapture(VIDEO_PATH)
-video_fps = cap.get(cv2.CAP_PROP_FPS)
-if video_fps <= 0 or video_fps > 120:
-    video_fps = 30.0
-frame_duration    = 1.0 / video_fps
-last_frame_time   = -999.0
+# ── Video ───────────────────────────────────────────────────────────
+VIDEO_PATH = os.path.join(os.path.dirname(__file__), "..", "A.mp4")
+cap_video = cv2.VideoCapture(VIDEO_PATH)
+video_fps = cap_video.get(cv2.CAP_PROP_FPS)
+if video_fps <= 0:
+    video_fps = 20.0
+video_total_frames = int(cap_video.get(cv2.CAP_PROP_FRAME_COUNT))
 cached_frame_surf = None
 
-ARROW_TARGET_Y = WINDOW_HEIGHT - 120
-ARROW_START_Y  = WINDOW_HEIGHT + 70
-ARROW_X        = WINDOW_WIDTH  // 2
-ARROW_TRAVEL   = 1.2
-ARROW_WINDOW   = 0.35
+# ── Load jump cues from predicted_actions.jsonl ─────────────────────
+JSONL_PATH = os.path.join(os.path.dirname(__file__), "..", "predicted_actions.jsonl")
+CUE_LEAD   = 0.15   # seconds before jump to show circle
+CUE_LINGER = 0.35   # seconds after jump to keep circle
+CUE_RADIUS = 50
+CUE_APPROACH_TIME = 2.0   # seconds before cue that falling indicator starts
 
-jump_times = [4, 7, 10, 13, 16, 19, 22, 25, 28, 31]
+def load_jump_times(jsonl_path, fps):
+    """Extract onset times (seconds) when space first appears."""
+    times = []
+    prev_space = False
+    with open(jsonl_path) as f:
+        for line in f:
+            entry = json.loads(line)
+            frame = entry["frame"]
+            has_space = "key.keyboard.space" in entry.get("keyboard", {}).get("keys", [])
+            if has_space and not prev_space:
+                times.append(frame / fps)
+            prev_space = has_space
+    return times
+
+jump_times = load_jump_times(JSONL_PATH, video_fps)
+print(f"Jump cues loaded: {len(jump_times)} onsets")
+if jump_times:
+    print(f"  First 5 times: {jump_times[:5]}")
+
+# ── Webcam ──────────────────────────────────────────────────────────
+cap_webcam = cv2.VideoCapture(0)
+webcam_fps = cap_webcam.get(cv2.CAP_PROP_FPS) or 30.0
+webcam_frame_idx = 0
+
+# ── YOLO person counter (INTRO / COUNTDOWN only) ───────────────────
+yolo_model = YOLO("yolov8n.pt")
+
+def count_people_yolo(frame_bgr):
+    """Return the number of people detected by YOLO in a BGR frame."""
+    results = yolo_model(frame_bgr, verbose=False)
+    count = 0
+    for r in results:
+        for cls_id in r.boxes.cls:
+            if int(cls_id) == 0:
+                count += 1
+    return count
+
+# ── Pose detector (created at lock time with exact player count) ───
+detector = None
+
+# ── State ──────────────────────────────────────────────────────────
+STATE_INTRO     = 0
+STATE_COUNTDOWN = 1
+STATE_PLAYING   = 2
+
+state = STATE_INTRO
+countdown_start: float = 0.0
+locked_player_count: int = 0
+player_avatars: list[pygame.Surface] = []
+
+player_id_map: dict[int, int] = {}
+player_actions: list[dict] = []
+player_scores: list[int] = []
+player_prev_jumping: list[bool] = []
 
 start_time = time.time()
 
-ai_offsets = {}
-for i, name in enumerate(players):
-    if name != "You":
-        ai_offsets[name] = 0.1 * (1 if i % 2 == 0 else -1)
+leaderboard_font = pygame.font.SysFont("arial", 28, bold=True)
+leaderboard_title_font = pygame.font.SysFont("arial", 34, bold=True)
+score_font = pygame.font.SysFont("arial", 22)
 
-amazing_popups = [{"active": False, "timer": 0.0} for _ in players]
 
-class Arrow:
-    def __init__(self, spawn_game_time):
-        self.spawn_time     = spawn_game_time
-        self.hit            = False
-        self.missed         = False
-        self.hit_time       = None
-        self.ai_press_times = {}
-        self.ai_scored      = {}
+# ── Drawing helpers ─────────────────────────────────────────────────
+last_video_frame_idx = -1          # track which frame we last displayed
 
-    def get_y(self, ct):
-        t      = min((ct - self.spawn_time) / ARROW_TRAVEL, 1.0)
-        t_ease = 1 - (1 - t) ** 3
-        return ARROW_START_Y + t_ease * (ARROW_TARGET_Y - ARROW_START_Y)
+def draw_video_bg(surface, ct):
+    """Seek to the time-correct video frame for properly-paced playback."""
+    global cached_frame_surf, last_video_frame_idx
+    target_frame = int(ct * video_fps) % max(video_total_frames, 1)
 
-    def is_in_window(self, ct):
-        return abs((ct - self.spawn_time) - ARROW_TRAVEL) < ARROW_WINDOW
+    if target_frame != last_video_frame_idx:
+        current_pos = int(cap_video.get(cv2.CAP_PROP_POS_FRAMES))
+        # If the next read would naturally give us the target, just read
+        if current_pos == target_frame:
+            ret, frame = cap_video.read()
+        else:
+            # Seek to the target frame
+            cap_video.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
+            ret, frame = cap_video.read()
+        if not ret:
+            cap_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = cap_video.read()
+        if ret:
+            frame = cv2.resize(frame, (WINDOW_WIDTH, WINDOW_HEIGHT))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frame = np.transpose(frame, (1, 0, 2))
+            cached_frame_surf = pygame.surfarray.make_surface(frame)
+            last_video_frame_idx = target_frame
+    if cached_frame_surf:
+        surface.blit(cached_frame_surf, (0, 0))
 
-    def is_expired(self, ct):
-        return (ct - self.spawn_time) > ARROW_TRAVEL + ARROW_WINDOW + 0.5
 
-active_arrows    = []
-used_spawn_times = set()
+def draw_webcam_bg(surface, wc_frame):
+    """Draw the webcam frame as a full-screen background."""
+    if wc_frame is None:
+        return
+    frame = cv2.resize(wc_frame, (WINDOW_WIDTH, WINDOW_HEIGHT))
+    frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    frame = np.transpose(frame, (1, 0, 2))
+    surf = pygame.surfarray.make_surface(frame)
+    surface.blit(surf, (0, 0))
 
-hit_flash = {"active": False, "timer": 0.0, "label": "PERFECT!", "color": YELLOW}
 
-def draw_arrow_shape(surface, cx, cy, color, scale=1.0, alpha=255):
-    w      = int(40 * scale)
-    sw     = int(15 * scale)
-    head_h = int(55 * scale)
-    sh     = int(45 * scale)
-    pts = [
-        (cx,      cy - head_h),
-        (cx - w,  cy),
-        (cx - sw, cy),
-        (cx - sw, cy + sh),
-        (cx + sw, cy + sh),
-        (cx + sw, cy),
-        (cx + w,  cy),
-    ]
-    if alpha < 255:
-        s = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-        pygame.draw.polygon(s, (*color, alpha), pts)
-        surface.blit(s, (0, 0))
-    else:
-        pygame.draw.polygon(surface, color, pts)
+def draw_centered_text(surface, text, font, color, y, shadow=True):
+    if shadow:
+        sh = font.render(text, True, BLACK)
+        surface.blit(sh, (WINDOW_WIDTH // 2 - sh.get_width() // 2 + 2, y + 2))
+    sf = font.render(text, True, color)
+    surface.blit(sf, (WINDOW_WIDTH // 2 - sf.get_width() // 2, y))
 
-def draw_ghost_arrow(surface, cx, cy):
-    w = 40; sw = 15; head_h = 55; sh = 45
-    pts = [
-        (cx,      cy - head_h),
-        (cx - w,  cy),
-        (cx - sw, cy),
-        (cx - sw, cy + sh),
-        (cx + sw, cy + sh),
-        (cx + sw, cy),
-        (cx + w,  cy),
-    ]
-    gs = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
-    pygame.draw.polygon(gs, (255, 255, 255, 20), pts)
-    pygame.draw.polygon(gs, (255, 60, 80, 90), pts, 3)
-    surface.blit(gs, (0, 0))
 
-def draw_hud(surface, ct):
-    n     = len(players)
-    pad   = 18
-    gap   = 16
+def draw_player_hud(surface):
+    n = locked_player_count
+    if n == 0:
+        return
+    gap = 24
     total_w = n * AVATAR_SIZE + (n - 1) * gap
     start_x = (WINDOW_WIDTH - total_w) // 2
+    y = 20
 
-    for i, name in enumerate(players):
-        color  = PLAYER_COLORS[i % len(PLAYER_COLORS)]
-        ax     = start_x + i * (AVATAR_SIZE + gap)
-        ay     = pad
+    for i in range(n):
+        ax = start_x + i * (AVATAR_SIZE + gap)
 
-        shadow_surf = pygame.Surface((AVATAR_SIZE + 8, AVATAR_SIZE + 8), pygame.SRCALPHA)
-        shadow_surf.fill((0, 0, 0, 90))
-        surface.blit(shadow_surf, (ax - 4, ay + 4))
+        shadow = pygame.Surface((AVATAR_SIZE + 8, AVATAR_SIZE + 8), pygame.SRCALPHA)
+        shadow.fill((0, 0, 0, 100))
+        surface.blit(shadow, (ax - 4, y + 4))
+        surface.blit(player_avatars[i], (ax, y))
 
-        surface.blit(avatars[i], (ax, ay))
+        lbl = label_font.render(f"Player {i + 1}", True, WHITE)
+        lx = ax + AVATAR_SIZE // 2 - lbl.get_width() // 2
+        ly = y + AVATAR_SIZE + 6
+        sh = label_font.render(f"Player {i + 1}", True, BLACK)
+        surface.blit(sh, (lx + 1, ly + 1))
+        surface.blit(lbl, (lx, ly))
 
-        pygame.draw.rect(surface, color, (ax, ay, AVATAR_SIZE, AVATAR_SIZE), 2)
+        actions = player_actions[i] if i < len(player_actions) else {}
+        is_running = actions.get("running", False)
+        is_jumping = actions.get("jumping", False)
+        circle_x = ax + AVATAR_SIZE // 2
+        circle_y = ly + lbl.get_height() + 8 + CIRCLE_RADIUS
 
-        score_str  = str(scores[name])
-        sh_surf    = score_font.render(score_str, True, BLACK)
-        sc_surf    = score_font.render(score_str, True, WHITE)
-        tx = ax + AVATAR_SIZE // 2 - sc_surf.get_width() // 2
-        ty = ay + AVATAR_SIZE + 4
-        surface.blit(sh_surf, (tx + 1, ty + 1))
-        surface.blit(sc_surf, (tx,     ty))
+        if is_jumping:
+            pygame.draw.circle(surface, GREEN, (circle_x, circle_y), CIRCLE_RADIUS)
+            pygame.draw.circle(surface, WHITE, (circle_x, circle_y), CIRCLE_RADIUS, 2)
+            circle_y += CIRCLE_RADIUS * 2 + 6
 
-        # Name label above (small, colored, shadowed)
-        nm_sh = small_font.render(name.upper(), True, BLACK)
-        nm_sf = small_font.render(name.upper(), True, color)
-        nx = ax + AVATAR_SIZE // 2 - nm_sf.get_width() // 2
-        ny = ay - nm_sf.get_height() - 2
-        surface.blit(nm_sh, (nx + 1, ny + 1))
-        surface.blit(nm_sf, (nx,     ny))
+        if is_running:
+            pygame.draw.circle(surface, ORANGE, (circle_x, circle_y), CIRCLE_RADIUS)
+            pygame.draw.circle(surface, WHITE, (circle_x, circle_y), CIRCLE_RADIUS, 2)
 
-        popup = amazing_popups[i]
-        if popup["active"]:
-            age   = ct - popup["timer"]
-            if age > 1.2:
-                popup["active"] = False
-            else:
-                alpha  = int(255 * max(0, 1 - age / 1.2))
-                rise   = int(age * 30)
-                a_surf = amaz_font.render("Amazing!", True, YELLOW)
-                a_surf = pygame.transform.rotate(a_surf, 30)
-                a_surf.set_alpha(alpha)
-                px = ax + AVATAR_SIZE // 2 - a_surf.get_width() // 2
-                py = ay + AVATAR_SIZE // 2 - a_surf.get_height() // 2 - rise
-                surface.blit(a_surf, (px, py))
 
-def draw_hit_flash(surface, flash_state, ct):
-    if not flash_state["active"]:
+def draw_leaderboard(surface):
+    """Draw a semi-transparent leaderboard sidebar on the right."""
+    n = locked_player_count
+    if n == 0:
         return
-    age = ct - flash_state["timer"]
-    if age > 0.55:
-        flash_state["active"] = False
-        return
-    alpha = int(255 * (1 - age / 0.55))
-    scale = 1.0 + age * 2.0
-    lbl   = hit_font.render(flash_state["label"], True, flash_state["color"])
-    lbl   = pygame.transform.scale(lbl, (int(lbl.get_width() * scale),
-                                         int(lbl.get_height() * scale)))
-    lbl.set_alpha(alpha)
-    surface.blit(lbl, (ARROW_X - lbl.get_width()  // 2,
-                        ARROW_TARGET_Y - 110 - lbl.get_height() // 2))
+    # Semi-transparent background
+    sidebar = pygame.Surface((SIDEBAR_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+    sidebar.fill(SIDEBAR_BG)
+    surface.blit(sidebar, (WINDOW_WIDTH - SIDEBAR_WIDTH, 0))
 
+    sx = WINDOW_WIDTH - SIDEBAR_WIDTH + 16
+    # Title
+    title = leaderboard_title_font.render("Leaderboard", True, GOLD)
+    surface.blit(title, (sx, 20))
+    # Divider line
+    pygame.draw.line(surface, GOLD,
+                     (sx, 60), (WINDOW_WIDTH - 16, 60), 2)
+
+    # Sort players by score descending
+    ranked = sorted(range(n), key=lambda i: player_scores[i], reverse=True)
+    for rank, i in enumerate(ranked):
+        y = 75 + rank * 72
+        # Avatar
+        small_av = pygame.transform.smoothscale(player_avatars[i], (44, 44))
+        surface.blit(small_av, (sx, y + 4))
+        # Name
+        name = leaderboard_font.render(f"Player {i + 1}", True, WHITE)
+        surface.blit(name, (sx + 52, y + 2))
+        # Score
+        pts = score_font.render(f"{player_scores[i]} pts", True, GREEN)
+        surface.blit(pts, (sx + 52, y + 32))
+        # Rank medal
+        if rank == 0 and player_scores[i] > 0:
+            medal = leaderboard_font.render("⭐", True, GOLD)
+            surface.blit(medal, (WINDOW_WIDTH - 40, y + 8))
+
+
+# ── Main loop ───────────────────────────────────────────────────────
 running = True
 while running:
     clock.tick(FPS)
     ct = time.time() - start_time
 
-    # --- Events ---
     for event in pygame.event.get():
         if event.type == pygame.QUIT:
             running = False
-        if event.type == pygame.KEYDOWN:
-            if event.key == pygame.K_ESCAPE:
-                running = False
-            if event.key == pygame.K_SPACE:
-                for arrow in active_arrows:
-                    if not arrow.hit and not arrow.missed and arrow.is_in_window(ct):
-                        arrow.hit      = True
-                        arrow.hit_time = ct
-                        scores["You"] += 10
-                        hit_flash.update(active=True, timer=ct,
-                                         label="PERFECT!", color=YELLOW)
-                        you_idx = players.index("You")
-                        amazing_popups[you_idx] = {"active": True, "timer": ct}
-                        break
+        if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
+            running = False
 
-    # --- Spawn arrows ---
-    for jt in jump_times:
-        spawn_t = jt - ARROW_TRAVEL
-        if spawn_t not in used_spawn_times and ct >= spawn_t:
-            used_spawn_times.add(spawn_t)
-            a = Arrow(spawn_t)
-            for ai_name, offset in ai_offsets.items():
-                a.ai_press_times[ai_name] = jt + offset
-                a.ai_scored[ai_name]      = False
-            active_arrows.append(a)
+    # ── Webcam frame + detection ────────────────────────────────────
+    ret_wc, wc_frame = cap_webcam.read()
+    if ret_wc:
+        wc_frame = cv2.flip(wc_frame, 1)   # mirror horizontally
+    persons = []
 
-    # --- AI scoring ---
-    for arrow in active_arrows:
-        for ai_name, press_t in arrow.ai_press_times.items():
-            if not arrow.ai_scored[ai_name] and ct >= press_t:
-                elapsed = press_t - arrow.spawn_time
-                if abs(elapsed - ARROW_TRAVEL) < ARROW_WINDOW + 0.2:
-                    scores[ai_name] += 10
-                    ai_idx = players.index(ai_name)
-                    amazing_popups[ai_idx] = {"active": True, "timer": ct}
-                arrow.ai_scored[ai_name] = True
+    # Only run PoseDetector during PLAYING (fast, no YOLO overhead)
+    if state == STATE_PLAYING and ret_wc and detector is not None:
+        persons = detector.process_frame(wc_frame, webcam_frame_idx)
+        webcam_frame_idx += 1
 
-    # --- Expire arrows ---
-    for arrow in active_arrows:
-        if not arrow.hit and arrow.is_expired(ct):
-            arrow.missed = True
-    active_arrows = [a for a in active_arrows
-                     if not (a.missed and a.is_expired(ct))]
-
-    # --- Video frame (native FPS) ---
-    if ct - last_frame_time >= frame_duration:
-        ret, frame = cap.read()
-        if not ret:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-            ret, frame = cap.read()
-        if ret:
-            frame = cv2.resize(frame, (WINDOW_WIDTH, WINDOW_HEIGHT))
-            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-            cached_frame_surf = pygame.surfarray.make_surface(np.rot90(frame))
-        last_frame_time = ct
-
-    # --- Draw ---
+    # ── Draw background ─────────────────────────────────────────────
     screen.fill(DARK)
+    if state == STATE_PLAYING:
+        draw_video_bg(screen, ct)
+    elif ret_wc:
+        draw_webcam_bg(screen, wc_frame)
 
-    if cached_frame_surf:
-        screen.blit(cached_frame_surf, (0, 0))
+    # ── State machine ───────────────────────────────────────────────
+    if state == STATE_INTRO:
+        draw_centered_text(
+            screen, "Stand in frame!", title_font, WHITE, WINDOW_HEIGHT // 2 - 30
+        )
+        if ret_wc:
+            yolo_count = count_people_yolo(wc_frame)
+            if yolo_count >= 1:
+                state = STATE_COUNTDOWN
+                countdown_start = time.time()
 
-    draw_ghost_arrow(screen, ARROW_X, ARROW_TARGET_Y)
+    elif state == STATE_COUNTDOWN:
+        elapsed = time.time() - countdown_start
+        remaining = COUNTDOWN_SECONDS - elapsed
 
-    for arrow in active_arrows:
-        if arrow.missed:
-            continue
-        if arrow.hit:
-            age = ct - arrow.hit_time
-            if age < 0.28:
-                sc    = 1.0 + age * 3.5
-                alpha = int(255 * (1 - age / 0.28))
-                draw_arrow_shape(screen, ARROW_X, ARROW_TARGET_Y,
-                                 YELLOW, scale=sc, alpha=alpha)
-            continue
-        y      = arrow.get_y(ct)
-        in_win = arrow.is_in_window(ct)
-        color  = YELLOW if in_win else RED
-        draw_arrow_shape(screen, ARROW_X, int(y), color)
-        draw_arrow_shape(screen, ARROW_X, int(y), color, scale=1.18, alpha=50)
+        yolo_count = 0
+        if ret_wc:
+            yolo_count = count_people_yolo(wc_frame)
 
-    draw_hud(screen, ct)
+        if remaining > 0:
+            draw_centered_text(
+                screen, str(int(remaining) + 1), count_font, WHITE,
+                WINDOW_HEIGHT // 2 - 70,
+            )
+            draw_centered_text(
+                screen,
+                f"{yolo_count} player{'s' if yolo_count != 1 else ''} detected",
+                title_font, WHITE, WINDOW_HEIGHT // 2 + 50,
+            )
+        else:
+            locked_player_count = max(yolo_count, 1)
+            player_avatars = [load_avatar(i) for i in range(locked_player_count)]
+            player_actions = [
+                {"running": False, "jumping": False}
+                for _ in range(locked_player_count)
+            ]
+            player_scores = [0] * locked_player_count
+            player_prev_jumping = [False] * locked_player_count
+            player_id_map = {}
+            detector = PoseDetector(
+                max_poses=locked_player_count, fps=webcam_fps
+            )
+            start_time = time.time()   # reset so video frame 0 = now
+            cap_video.set(cv2.CAP_PROP_POS_FRAMES, 0)  # rewind video
+            last_video_frame_idx = -1
+            state = STATE_PLAYING
 
-    draw_hit_flash(screen, hit_flash, ct)
+    elif state == STATE_PLAYING:
+        id_to_person = {p.id: p for p in persons}
+        claimed_ids = set()
+        for slot in range(locked_player_count):
+            pid = player_id_map.get(slot)
+            if pid is not None and pid in id_to_person:
+                claimed_ids.add(pid)
 
-    hint = small_font.render("SPACE to hit!", True, (200, 200, 200))
-    screen.blit(hint, (ARROW_X - hint.get_width() // 2, WINDOW_HEIGHT - 22))
+        for slot in range(locked_player_count):
+            pid = player_id_map.get(slot)
+            if pid is not None and pid in id_to_person:
+                p = id_to_person[pid]
+                player_actions[slot]["running"] = p.is_running
+                player_actions[slot]["jumping"] = p.is_jumping
+            else:
+                reassigned = False
+                for p in persons:
+                    if p.frames_missing == 0 and p.id not in claimed_ids:
+                        player_id_map[slot] = p.id
+                        claimed_ids.add(p.id)
+                        player_actions[slot]["running"] = p.is_running
+                        player_actions[slot]["jumping"] = p.is_jumping
+                        reassigned = True
+                        break
+                if not reassigned:
+                    player_actions[slot]["running"] = False
+                    player_actions[slot]["jumping"] = False
+
+        draw_player_hud(screen)
+
+        # ── Score jump transitions (+10 per jump onset) ─────────────
+        for slot in range(locked_player_count):
+            now_jumping = player_actions[slot].get("jumping", False)
+            if now_jumping and not player_prev_jumping[slot]:
+                player_scores[slot] += 10
+            player_prev_jumping[slot] = now_jumping
+
+        draw_leaderboard(screen)
+
+    # ── Debug cam (bottom-left) ─────────────────────────────────────
+    if ret_wc:
+        debug_frame = wc_frame.copy()
+        h, w = debug_frame.shape[:2]
+        for p in persons:
+            if p.last_landmarks is not None and p.frames_missing == 0:
+                draw_skeleton(debug_frame, p.last_landmarks, h, w)
+        debug_frame = cv2.resize(debug_frame, (DEBUG_W, DEBUG_H))
+        debug_frame = cv2.cvtColor(debug_frame, cv2.COLOR_BGR2RGB)
+        debug_frame = np.transpose(debug_frame, (1, 0, 2))
+        debug_surf = pygame.surfarray.make_surface(debug_frame)
+        pygame.draw.rect(
+            screen, WHITE,
+            (0, WINDOW_HEIGHT - DEBUG_H - 2, DEBUG_W + 4, DEBUG_H + 4), 2,
+        )
+        screen.blit(debug_surf, (2, WINDOW_HEIGHT - DEBUG_H))
+
+    # ── Jump cue circle (bottom center) ────────────────────────────
+    if state == STATE_PLAYING:
+        cue_x = WINDOW_WIDTH // 2
+        cue_y = WINDOW_HEIGHT - CUE_RADIUS - 30
+
+        # Always draw the target ring outline
+        pygame.draw.circle(screen, (60, 60, 60), (cue_x, cue_y), CUE_RADIUS, 3)
+
+        # Active cue — fill the circle green
+        show_cue = False
+        for jt in jump_times:
+            if (jt - CUE_LEAD) <= ct <= (jt + CUE_LINGER):
+                show_cue = True
+                break
+        if show_cue:
+            pygame.draw.circle(screen, GREEN, (cue_x, cue_y), CUE_RADIUS)
+            pygame.draw.circle(screen, WHITE, (cue_x, cue_y), CUE_RADIUS, 3)
+
+        # Falling approach indicators
+        approach_start_y = 80              # start near top of screen
+        for jt in jump_times:
+            arrive_time = jt - CUE_LEAD    # when the ball should reach the target
+            approach_start_t = arrive_time - CUE_APPROACH_TIME
+            if approach_start_t <= ct < arrive_time:
+                # Progress 0→1 as the circle falls
+                progress = (ct - approach_start_t) / CUE_APPROACH_TIME
+                # Interpolate Y from top to target
+                fall_y = int(approach_start_y + (cue_y - approach_start_y) * progress)
+                # Shrink from 18px to CUE_RADIUS as it approaches
+                ball_r = int(18 + (CUE_RADIUS - 18) * progress)
+                # Fade in opacity
+                alpha = int(80 + 175 * progress)
+                # Draw the falling ball
+                ball_surf = pygame.Surface((ball_r * 2, ball_r * 2), pygame.SRCALPHA)
+                pygame.draw.circle(ball_surf, (0, 200, 80, alpha),
+                                   (ball_r, ball_r), ball_r)
+                pygame.draw.circle(ball_surf, (255, 255, 255, alpha),
+                                   (ball_r, ball_r), ball_r, 2)
+                screen.blit(ball_surf, (cue_x - ball_r, fall_y - ball_r))
 
     pygame.display.flip()
 
+# ── Cleanup ─────────────────────────────────────────────────────────
+if detector is not None:
+    detector.close()
+cap_webcam.release()
+cap_video.release()
 pygame.quit()
-cap.release()
