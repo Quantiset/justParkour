@@ -5,6 +5,7 @@ import math
 import time
 from dotenv import load_dotenv
 
+import re
 import random
 import threading
 import json
@@ -16,12 +17,10 @@ import yt_dlp
 import boto3
 import imageio_ffmpeg as ffmpeg
 
-# ── Allow importing body.py from the project root ──────────────────
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from body_new import PoseDetector, draw_skeleton  # noqa: E402
 from ultralytics import YOLO  # noqa: E402
 
-# ── Load environment ────────────────────────────────────────────────
 load_dotenv()
 
 s3 = boto3.client(
@@ -32,8 +31,9 @@ s3 = boto3.client(
 )
 bucket_name = "minecraft-videos-dance"
 
+GEMINI_KEY = os.getenv("GEMINI_KEY")
+GEMINI_API_URL = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
 
-# ── Constants ───────────────────────────────────────────────────────
 WINDOW_WIDTH  = 1280
 WINDOW_HEIGHT = 720
 FPS           = 30
@@ -45,7 +45,6 @@ SIDEBAR_WIDTH = 220
 DEBUG_W = WINDOW_WIDTH  // 4
 DEBUG_H = WINDOW_HEIGHT // 4
 
-# ── Colours ─────────────────────────────────────────────────────────
 DARK   = (18, 18, 24)
 WHITE  = (255, 255, 255)
 BLACK  = (0, 0, 0)
@@ -58,7 +57,6 @@ SIDEBAR_BG = (20, 20, 30, 180)
 
 CUE_COLORS = [GREEN, BLUE, PINK, ORANGE]
 
-# ── Game constants ──────────────────────────────────────────────────
 WINDOW_WIDTH  = 1280
 WINDOW_HEIGHT = 720
 FPS           = 30
@@ -70,7 +68,6 @@ SIDEBAR_WIDTH = 220
 DEBUG_W = WINDOW_WIDTH  // 4
 DEBUG_H = WINDOW_HEIGHT // 4
 
-# ── Colours ─────────────────────────────────────────────────────────
 DARK   = (18, 18, 24)
 WHITE  = (255, 255, 255)
 BLACK  = (0, 0, 0)
@@ -83,7 +80,7 @@ SIDEBAR_BG = (20, 20, 30, 180)
 VOICE_LINES = [
     "chicken jockey",
     "water bucket, release",
-    "amaaazing",
+    "amaezing",
     "i am steve",
     "this... is a crafting table",
     "they love crushing loaf",
@@ -94,35 +91,30 @@ os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
 
 last_congrats_time = -999.0
 CONGRATS_COOLDOWN = 5.0
+GEMINI_VOICE_COOLDOWN = 10.0
+last_gemini_voice_time = -999.0
 
 def line_to_filename(line: str) -> str:
-    """Consistent sanitization: keep only alphanumerics and underscores."""
-    import re
     safe = re.sub(r"[^a-z0-9]+", "_", line.lower()).strip("_")
     return safe + ".mp3"
 
 def pregenerate_voice_lines():
-    """Download and cache all voice lines at startup if not already cached."""
     ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
     if not ELEVENLABS_API_KEY:
         print("[TTS] No ELEVENLABS_API_KEY found, skipping pregeneration.")
         return
     VOICE_ID = "z2RqfzHxVAbH6LCC7Jc3"
     url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json"
-    }
+    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
     for line in VOICE_LINES:
         path = os.path.join(AUDIO_CACHE_DIR, line_to_filename(line))
         if not os.path.exists(path):
             print(f"[TTS] Generating: '{line}' -> {os.path.basename(path)}")
             try:
-                payload = {
+                resp = requests.post(url, json={
                     "text": line,
                     "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
-                }
-                resp = requests.post(url, json=payload, headers=headers)
+                }, headers=headers)
                 resp.raise_for_status()
                 with open(path, "wb") as f:
                     f.write(resp.content)
@@ -132,45 +124,162 @@ def pregenerate_voice_lines():
         else:
             print(f"[TTS] Already cached: {os.path.basename(path)}")
 
-def play_congratulations():
-    """Play a random cached voice line if cooldown has elapsed."""
-    global last_congrats_time
-    now = time.time()
-    if now - last_congrats_time < CONGRATS_COOLDOWN:
-        return
-    last_congrats_time = now
+def _play_audio_file(path: str):
+    """Load and play an MP3 file via pygame mixer (call from any thread)."""
+    try:
+        pygame.mixer.music.stop()
+        pygame.mixer.music.unload()
+        pygame.mixer.music.load(path)
+        pygame.mixer.music.play()
+        print(f"[TTS] Playing: {os.path.basename(path)}")
+    except Exception as e:
+        print(f"[TTS error] {e}")
 
-    def _run():
-        line = random.choice(VOICE_LINES)
-        path = os.path.join(AUDIO_CACHE_DIR, line_to_filename(line))
-        if not os.path.exists(path):
-            print(f"[TTS] Cache miss for '{line}' at {path}, skipping.")
-            return
+def _speak_text_via_elevenlabs(text: str):
+    """Call ElevenLabs with arbitrary text and play it (blocks until done)."""
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+    VOICE_ID = "z2RqfzHxVAbH6LCC7Jc3"
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+    headers = {"xi-api-key": ELEVENLABS_API_KEY, "Content-Type": "application/json"}
+    try:
+        resp = requests.post(url, json={
+            "text": text,
+            "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+        }, headers=headers)
+        resp.raise_for_status()
+        # Write to a uniquely-named temp file to avoid Windows lock conflicts
+        import tempfile
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False,
+                                         dir=AUDIO_CACHE_DIR, prefix="gemini_") as tmp:
+            tmp.write(resp.content)
+            path = tmp.name
+        _play_audio_file(path)
+        # Wait for playback then clean up
+        while pygame.mixer.music.get_busy():
+            time.sleep(0.05)
         try:
-            pygame.mixer.music.stop()
-            pygame.mixer.music.unload()
-            pygame.mixer.music.load(path)
-            pygame.mixer.music.play()
-            print(f"[TTS] Playing: '{line}'")
-        except Exception as e:
-            print(f"[TTS error] {e}")
+            os.remove(path)
+        except Exception:
+            pass
+    except Exception as e:
+        print(f"[Gemini TTS error] {e}")
 
-    threading.Thread(target=_run, daemon=True).start()
+def ask_gemini_for_voice_line(scores: list, calories: list, ct: float) -> str | None:
+    """Ask Gemini for a short encouraging in-game voice line. Returns text or None."""
+    if not GEMINI_KEY:
+        return None
+    n = len(scores)
+    score_summary = ", ".join(f"Player {i+1}: {scores[i]} pts" for i in range(n))
+    prompt = (
+        f"You are a hype commentator for a Minecraft parkour dance game called JustParkour. "
+        f"The game has been running for {ct:.0f} seconds. "
+        f"Current scores: {score_summary}. "
+        f"Write ONE short, punchy, encouraging in-game voice line (max 8 words). "
+        f"Make it fun and Minecraft-themed. Return only the voice line, nothing else."
+    )
+    try:
+        resp = requests.post(
+            GEMINI_API_URL,
+            params={"key": GEMINI_KEY},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=5
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        text = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        return text
+    except Exception as e:
+        print(f"[Gemini] Error: {e}")
+        return None
 
-# ── Pygame init ─────────────────────────────────────────────────────
+def fetch_game_summary(scores: list, calories: list, game_duration: float) -> list[str]:
+    """Ask Gemini for a post-game summary and improvement tips. Returns list of lines."""
+    if not GEMINI_KEY:
+        return ["Game over!", "Nice effort from all players."]
+    n = len(scores)
+    score_summary = ", ".join(f"Player {i+1}: {scores[i]} pts, {calories[i]:.1f} cal" for i in range(n))
+    prompt = (
+        f"A Minecraft parkour dance game called JustParkour just ended after {game_duration:.0f} seconds. "
+        f"Results: {score_summary}. "
+        f"Write a fun, brief post-game summary (2-3 sentences) and 1-2 bullet points on what players can improve. "
+        f"Keep it under 60 words total. Use Minecraft-themed language. "
+        f"Format: summary paragraph, then bullet points starting with '•'."
+    )
+    try:
+        resp = requests.post(
+            GEMINI_API_URL,
+            params={"key": GEMINI_KEY},
+            json={"contents": [{"parts": [{"text": prompt}]}]},
+            timeout=8
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        raw = data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        # Split into wrapped lines for rendering
+        lines = []
+        for paragraph in raw.split("\n"):
+            paragraph = paragraph.strip()
+            if paragraph:
+                lines.append(paragraph)
+        return lines
+    except Exception as e:
+        print(f"[Gemini summary] Error: {e}")
+        return ["Game over! Great effort, everyone.", "• Keep jumping on the beat!", "• Stay active to avoid score penalties."]
+
+def play_congratulations(scores: list, calories: list, ct: float):
+    """Play a voice line on a correct jump. 40% chance = Gemini-generated."""
+    global last_congrats_time, last_gemini_voice_time
+    now = time.time()
+
+    # Respect the longer cooldown if a Gemini line was recently played
+    effective_cooldown = CONGRATS_COOLDOWN
+    if now - last_gemini_voice_time < GEMINI_VOICE_COOLDOWN:
+        return  # Still in Gemini silence window
+    if now - last_congrats_time < effective_cooldown:
+        return
+
+    use_gemini = random.random() < 0.00
+
+    if use_gemini:
+        last_congrats_time = now
+        last_gemini_voice_time = now
+        scores_copy = list(scores)
+        cals_copy = list(calories)
+
+        def _run_gemini():
+            text = ask_gemini_for_voice_line(scores_copy, cals_copy, ct)
+            if text:
+                print(f"[Gemini voice] '{text}'")
+                _speak_text_via_elevenlabs(text)
+            else:
+                # Fallback to cached line if Gemini fails
+                _play_cached_line()
+
+        threading.Thread(target=_run_gemini, daemon=True).start()
+    else:
+        last_congrats_time = now
+        threading.Thread(target=_play_cached_line, daemon=True).start()
+
+def _play_cached_line():
+    line = random.choice(VOICE_LINES)
+    path = os.path.join(AUDIO_CACHE_DIR, line_to_filename(line))
+    if not os.path.exists(path):
+        print(f"[TTS] Cache miss for '{line}'")
+        return
+    _play_audio_file(path)
+
 pygame.init()
 pygame.mixer.init()
 pregenerate_voice_lines()
 screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
 pygame.scrap.init()
-pygame.display.set_caption("Dance Game – Body Detection")
+pygame.display.set_caption("JustParkour")
 clock = pygame.time.Clock()
 
 title_font = pygame.font.SysFont("arial", 48, bold=True)
 count_font = pygame.font.SysFont("arial", 120, bold=True)
 label_font = pygame.font.SysFont("arial", 18, bold=True)
 
-# ── Load avatars ────────────────────────────────────────────────────
 ASSET_DIR = os.path.join(os.path.dirname(__file__), "assets")
 AVATAR_FILES = ["creeper.jpg", "skeleton.jpg", "zombie.jpg"]
 
@@ -180,10 +289,8 @@ def load_avatar(index: int) -> pygame.Surface:
     img = pygame.image.load(path).convert_alpha()
     return pygame.transform.smoothscale(img, (AVATAR_SIZE, AVATAR_SIZE))
 
-# ── Video download & conversion ─────────────────────────────────────
 PRE_VIDEO_PATH = "video.mp4"
 
-# Global video state
 VIDEO_URL = ""
 VIDEO_NAME = ""
 VIDEO_PATH = ""
@@ -310,6 +417,11 @@ STATE_LOADING   = -2
 STATE_INTRO     = 0
 STATE_COUNTDOWN = 1
 STATE_PLAYING   = 2
+STATE_ENDSCREEN = 3
+
+end_summary_text: list[str] = []
+end_summary_ready = False
+restart_button_rect = pygame.Rect(WINDOW_WIDTH // 2 - 120, WINDOW_HEIGHT - 100, 240, 50)
 
 state = STATE_INPUT
 input_url_text = ""
@@ -702,13 +814,97 @@ while running:
                         
                 if valid_jump:
                     player_scores[slot] += 10
-                    play_congratulations()
+                    play_congratulations(player_scores, player_calories, ct)
                 else:
                     player_scores[slot] -= 5
 
             player_prev_jumping[slot] = now_jumping
 
         draw_leaderboard(screen)
+
+        if not video_playing:
+            state = STATE_ENDSCREEN
+            end_summary_ready = False
+            end_summary_text = ["Calculating results..."]
+            _scores_snap = list(player_scores)
+            _cals_snap = list(player_calories)
+            _dur_snap = ct
+            def _fetch_summary():
+                global end_summary_text, end_summary_ready
+                end_summary_text = fetch_game_summary(_scores_snap, _cals_snap, _dur_snap)
+                end_summary_ready = True
+            threading.Thread(target=_fetch_summary, daemon=True).start()
+    
+    elif state == STATE_ENDSCREEN:
+        overlay = pygame.Surface((WINDOW_WIDTH, WINDOW_HEIGHT), pygame.SRCALPHA)
+        overlay.fill((0, 0, 0, 210))
+        screen.blit(overlay, (0, 0))
+
+        title_surf = title_font.render("JustParkour — Game Over!", True, GOLD)
+        screen.blit(title_surf, (WINDOW_WIDTH // 2 - title_surf.get_width() // 2, 40))
+
+        y = 110
+        for i, (sc, cal) in enumerate(zip(player_scores, player_calories)):
+            line = leaderboard_font.render(
+                f"Player {i+1}:  {sc} pts  |  {int(cal)} cal burned", True, WHITE
+            )
+            screen.blit(line, (WINDOW_WIDTH // 2 - line.get_width() // 2, y))
+            y += 40
+
+        pygame.draw.line(screen, GOLD, (100, y + 10), (WINDOW_WIDTH - 100, y + 10), 2)
+        y += 28
+
+        summary_font = pygame.font.SysFont("arial", 22)
+        if not end_summary_ready:
+            wait_surf = summary_font.render("Asking Gemini for your recap...", True, ORANGE)
+            screen.blit(wait_surf, (WINDOW_WIDTH // 2 - wait_surf.get_width() // 2, y))
+        else:
+            for line in end_summary_text:
+                color = ORANGE if line.startswith("•") else WHITE
+                line_surf = summary_font.render(line, True, color)
+                # Word-wrap: if too wide, truncate (simple approach for fixed font)
+                if line_surf.get_width() > WINDOW_WIDTH - 200:
+                    # Split roughly in half
+                    words = line.split()
+                    mid = len(words) // 2
+                    for part in [" ".join(words[:mid]), " ".join(words[mid:])]:
+                        ps = summary_font.render(part, True, color)
+                        screen.blit(ps, (WINDOW_WIDTH // 2 - ps.get_width() // 2, y))
+                        y += 32
+                else:
+                    screen.blit(line_surf, (WINDOW_WIDTH // 2 - line_surf.get_width() // 2, y))
+                    y += 32
+
+        pygame.draw.rect(screen, GREEN, restart_button_rect, border_radius=10)
+        pygame.draw.rect(screen, WHITE, restart_button_rect, 2, border_radius=10)
+        btn_surf = leaderboard_font.render("Play Again", True, BLACK)
+        screen.blit(btn_surf, (
+            restart_button_rect.centerx - btn_surf.get_width() // 2,
+            restart_button_rect.centery - btn_surf.get_height() // 2
+        ))
+
+        # Handle button click
+        if pygame.mouse.get_pressed()[0]:
+            mx, my = pygame.mouse.get_pos()
+            if restart_button_rect.collidepoint(mx, my):
+                # Full reset back to URL input
+                state = STATE_INPUT
+                input_url_text = ""
+                player_avatars.clear()
+                player_id_map.clear()
+                player_actions.clear()
+                player_scores.clear()
+                player_calories.clear()
+                player_prev_jumping.clear()
+                if 'player_inactive_frames' in dir():
+                    player_inactive_frames.clear()
+                end_summary_text = []
+                end_summary_ready = False
+                detector = None
+                if cap_video is not None:
+                    cap_video.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                last_video_frame_idx = -1
+                start_time = time.time()
 
     # ── Debug cam (bottom-left) ─────────────────────────────────────
     if ret_wc and state not in [STATE_INPUT, STATE_LOADING]:
