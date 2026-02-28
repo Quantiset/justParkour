@@ -5,6 +5,7 @@ import math
 import time
 from dotenv import load_dotenv
 
+import random
 import threading
 import json
 import pygame
@@ -78,9 +79,88 @@ ORANGE = (255, 160, 0)
 GOLD   = (255, 215, 0)
 SIDEBAR_BG = (20, 20, 30, 180)
 
+
+VOICE_LINES = [
+    "chicken jockey",
+    "water bucket, release",
+    "amaaazing",
+    "i am steve",
+    "this... is a crafting table",
+    "they love crushing loaf",
+]
+
+AUDIO_CACHE_DIR = os.path.join(os.path.dirname(__file__), "audio")
+os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+
+last_congrats_time = -999.0
+CONGRATS_COOLDOWN = 5.0
+
+def line_to_filename(line: str) -> str:
+    """Consistent sanitization: keep only alphanumerics and underscores."""
+    import re
+    safe = re.sub(r"[^a-z0-9]+", "_", line.lower()).strip("_")
+    return safe + ".mp3"
+
+def pregenerate_voice_lines():
+    """Download and cache all voice lines at startup if not already cached."""
+    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
+    if not ELEVENLABS_API_KEY:
+        print("[TTS] No ELEVENLABS_API_KEY found, skipping pregeneration.")
+        return
+    VOICE_ID = "z2RqfzHxVAbH6LCC7Jc3"
+    url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
+    headers = {
+        "xi-api-key": ELEVENLABS_API_KEY,
+        "Content-Type": "application/json"
+    }
+    for line in VOICE_LINES:
+        path = os.path.join(AUDIO_CACHE_DIR, line_to_filename(line))
+        if not os.path.exists(path):
+            print(f"[TTS] Generating: '{line}' -> {os.path.basename(path)}")
+            try:
+                payload = {
+                    "text": line,
+                    "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
+                }
+                resp = requests.post(url, json=payload, headers=headers)
+                resp.raise_for_status()
+                with open(path, "wb") as f:
+                    f.write(resp.content)
+                print(f"[TTS] Saved: {path}")
+            except Exception as e:
+                print(f"[TTS] FAILED to generate '{line}': {e}")
+        else:
+            print(f"[TTS] Already cached: {os.path.basename(path)}")
+
+def play_congratulations():
+    """Play a random cached voice line if cooldown has elapsed."""
+    global last_congrats_time
+    now = time.time()
+    if now - last_congrats_time < CONGRATS_COOLDOWN:
+        return
+    last_congrats_time = now
+
+    def _run():
+        line = random.choice(VOICE_LINES)
+        path = os.path.join(AUDIO_CACHE_DIR, line_to_filename(line))
+        if not os.path.exists(path):
+            print(f"[TTS] Cache miss for '{line}' at {path}, skipping.")
+            return
+        try:
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+            pygame.mixer.music.load(path)
+            pygame.mixer.music.play()
+            print(f"[TTS] Playing: '{line}'")
+        except Exception as e:
+            print(f"[TTS error] {e}")
+
+    threading.Thread(target=_run, daemon=True).start()
+
 # ── Pygame init ─────────────────────────────────────────────────────
 pygame.init()
 pygame.mixer.init()
+pregenerate_voice_lines()
 screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
 pygame.display.set_caption("Dance Game – Body Detection")
 clock = pygame.time.Clock()
@@ -165,78 +245,6 @@ CUE_LINGER = 0.35
 CUE_RADIUS = 88
 CUE_APPROACH_TIME = 2.0
 MIN_CUE_GAP = 0.5
-
-def generate_voice(text: str):
-    ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-    VOICE_ID = "z2RqfzHxVAbH6LCC7Jc3"
-    OUTPUT_FILE = "speech.mp3"
-    TEXT_TO_SPEAK = text
-
-    # ── Request ───────────────────────────────────
-    url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-
-    headers = {
-        "xi-api-key": ELEVENLABS_API_KEY,
-        "Content-Type": "application/json"
-    }
-
-    payload = {
-        "text": TEXT_TO_SPEAK,
-        "voice_settings": {
-            "stability": 0.5,
-            "similarity_boost": 0.75
-        }
-    }
-
-    response = requests.post(url, json=payload, headers=headers)
-    response.raise_for_status()
-
-    # ── Save the audio ─────────────────────────────
-    with open(OUTPUT_FILE, "wb") as f:
-        f.write(response.content)
-
-    print(f"Saved speech to {OUTPUT_FILE}")
-
-def play_congratulations():
-    """Call ElevenLabs TTS and play 'congratulations' in a background thread."""
-    def _run():
-        try:
-            ELEVENLABS_API_KEY = os.getenv("ELEVENLABS_API_KEY")
-            VOICE_ID = "z2RqfzHxVAbH6LCC7Jc3"
-            url = f"https://api.elevenlabs.io/v1/text-to-speech/{VOICE_ID}"
-            headers = {
-                "xi-api-key": ELEVENLABS_API_KEY,
-                "Content-Type": "application/json"
-            }
-            payload = {
-                "text": "Congratulations!",
-                "voice_settings": {"stability": 0.5, "similarity_boost": 0.75}
-            }
-            response = requests.post(url, json=payload, headers=headers)
-            response.raise_for_status()
-
-            # Use a unique temp file so pygame never holds a lock on the one we're writing
-            import tempfile
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-                tmp.write(response.content)
-                audio_path = tmp.name
-
-            # Wait for any currently-playing music to finish before loading the next
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.05)
-
-            pygame.mixer.music.load(audio_path)
-            pygame.mixer.music.play()
-
-            # Wait for playback to finish, then delete the temp file
-            while pygame.mixer.music.get_busy():
-                time.sleep(0.05)
-            os.remove(audio_path)
-
-        except Exception as e:
-            print(f"[TTS error] {e}")
-
-    threading.Thread(target=_run, daemon=True).start()
 
 def load_jump_times(jsonl_path, fps):
     """Extract onset times (seconds) when space first appears, with min gap."""
